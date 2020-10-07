@@ -9,7 +9,7 @@ function deploy_challenge {
     #   The domain name (CN or subject alternative name) being
     #   validated.
     # - TOKEN_FILENAME
-    #   The name of the file is irrelevant for the DNS challenge, yet still provided 
+    #   The name of the file is irrelevant for the DNS challenge, yet still provided
     # - TOKEN_VALUE
     #   The token value that needs to be served for validation. For DNS
     #   validation, this is what you want to put in the _acme-challenge
@@ -24,7 +24,7 @@ function deploy_challenge {
     managedZones=${managedZones//$'\t'/,}
 
     mainDomainFound=false
-    for managedZone in $managedZones; do 
+    for managedZone in $managedZones; do
         IFS=$',' read dnsDomain zonename <<< "$managedZone"
 
         if [[ "$DOMAIN." == "$dnsDomain" || "$DOMAIN." == *".$dnsDomain" ]]; then
@@ -39,7 +39,6 @@ function deploy_challenge {
     fi
 
     test -f transaction.yaml && rm transaction.yaml
-    gcloud dns record-sets transaction start --zone $zonename
 
     # remove token, if it exists
     existingRecord=`gcloud dns record-sets list --name "_acme-challenge.$DOMAIN." --type TXT --zone $zonename --format='value(name,rrdatas[0],ttl)'`
@@ -50,10 +49,20 @@ function deploy_challenge {
     existingRrdata=${existingRrdata//$'"""'/''}
 
     if [ "$existingName" == "_acme-challenge.$DOMAIN." ]; then
-        gcloud dns record-sets transaction remove --name $existingName --type TXT --ttl $existingTtl --zone $zonename -- "$existingRrdata" 
+        # Remove old txt token
+        gcloud dns record-sets transaction start --zone $zonename
+        gcloud dns record-sets transaction remove --name $existingName --type TXT --ttl $existingTtl --zone $zonename -- "$existingRrdata"
+        gcloud dns record-sets transaction execute --zone $zonename --format='value(id)'
+
+        # Add new token with double value
+        test -f transaction.yaml && rm transaction.yaml
+        gcloud dns record-sets transaction start --zone $zonename
+        gcloud dns record-sets transaction add --name "_acme-challenge.$DOMAIN." --ttl 300 --type TXT --zone $zonename -- "$existingRrdata" "$TOKEN_VALUE"
+    else
+        gcloud dns record-sets transaction start --zone $zonename
+        gcloud dns record-sets transaction add --name "_acme-challenge.$DOMAIN." --ttl 300 --type TXT --zone $zonename -- "$TOKEN_VALUE"
     fi
 
-    gcloud dns record-sets transaction add --name "_acme-challenge.$DOMAIN." --ttl 300 --type TXT --zone $zonename -- "$TOKEN_VALUE" 
     gcloud dns record-sets transaction describe --zone $zonename
 
     changeID=$(gcloud dns record-sets transaction execute --zone $zonename --format='value(id)')
@@ -76,12 +85,12 @@ function deploy_challenge {
 
     # Even if the transaction is executed, the results may not be available in the DNS servers yet
     echo "Verifying results on live DNS servers:"
-    for nameserver in $(dig $dnsDomain NS +short); do 
-        echo -n "$nameserver " 
+    for nameserver in $(dig $dnsDomain NS +short); do
+        echo -n "$nameserver "
         nsresult=$(dig _acme-challenge.$DOMAIN TXT @$nameserver +short)
         # nsresult comes with the TXT RR in double quotes - remove those
         nsresult=${nsresult//$'"'/''}
-        until [[ "$nsresult" = "$TOKEN_VALUE" ]]; do
+        until [[ "$nsresult" == *"$TOKEN_VALUE"* ]]; do
             echo -n "pending"
             sleep 1
             echo -n "."
@@ -120,7 +129,7 @@ function clean_challenge {
     managedZones=${managedZones//$'\t'/,}
 
     mainDomainFound=false
-    for managedZone in $managedZones; do 
+    for managedZone in $managedZones; do
         IFS=$',' read dnsDomain zonename <<< "$managedZone"
 
         if [[ "$DOMAIN." == "$dnsDomain" || "$DOMAIN." == *".$dnsDomain" ]]; then
@@ -135,17 +144,38 @@ function clean_challenge {
     fi
 
     test -f transaction.yaml && rm transaction.yaml
-    gcloud dns record-sets transaction start --zone $zonename
 
-    existingRecord=`gcloud dns record-sets list --name "_acme-challenge.$DOMAIN." --type TXT --zone $zonename --format='value(name,rrdatas[0],ttl)'`
-    existingRecord=${existingRecord//$'\t'/,}
-    IFS=$',' read existingName existingRrdata existingTtl <<< "$existingRecord"
+    existingRecord=`gcloud dns record-sets list --name "_acme-challenge.$DOMAIN." --type TXT --zone $zonename --format='value(name,rrdatas,ttl)'`
+    IFS=$'\t' read existingName existingRrdata existingTtl <<< "$existingRecord"
+    existingRrdata=${existingRrdata//$'"'/''}
+    IFS=',' read -ra existingRrdata <<< "$existingRrdata"
 
-    # Replace threefold """ with singe "
-    existingRrdata=${existingRrdata//$'"""'/''}
+    if [[ ${#existingRrdata[@]} > 1 ]]; then
+      # Remove all record
+      gcloud dns record-sets transaction start --zone $zonename
+      stringify=${existingRrdata[@]}
+      stringify=${stringify// /"\" \""}
+      gcloud dns record-sets transaction remove --name $existingName --type TXT --ttl $existingTtl --zone $zonename -- \"${stringify}\"
+      gcloud dns record-sets transaction execute --zone $zonename
 
-    gcloud dns record-sets transaction remove --name $existingName --type TXT --ttl $existingTtl --zone $zonename -- "$existingRrdata"
-    gcloud dns record-sets transaction execute --zone $zonename
+      # Add remaining records
+      for i in "${!existingRrdata[@]}"; do
+        if [[ ${existingRrdata[i]} = $TOKEN_VALUE ]]; then
+          unset 'existingRrdata[i]'
+        fi
+      done
+
+      test -f transaction.yaml && rm transaction.yaml
+      gcloud dns record-sets transaction start --zone $zonename
+      stringify=${existingRrdata[@]}
+      stringify=${stringify// /"\" \""}
+      gcloud dns record-sets transaction add --name $existingName --type TXT --ttl $existingTtl --zone $zonename -- "${stringify}"
+      gcloud dns record-sets transaction execute --zone $zonename
+    else
+      gcloud dns record-sets transaction start --zone $zonename
+      gcloud dns record-sets transaction remove --name $existingName --type TXT --ttl $existingTtl --zone $zonename -- "${existingRrdata[0]}"
+      gcloud dns record-sets transaction execute --zone $zonename
+    fi
 }
 
 
